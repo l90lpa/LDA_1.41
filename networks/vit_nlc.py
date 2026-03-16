@@ -12,6 +12,91 @@ from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 from timm.models.layers import drop_path, to_2tuple, trunc_normal_
 cwd = os.getcwd()
 
+# ========================================================================================================
+
+import torch.autograd.forward_ad as fwAD
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from jvp_flash_attention.jvp_attention import JVPAttn, attention as jvp_attention
+
+
+def _unpack_qkv(qkv):
+    # 1. Unpack the packed tensor: (B, N, 3, H, D) -> 3 x (B, N, H, D)
+    q, k, v = qkv.unbind(dim=2)
+
+    # 2. Change layout to Head-First: (B, N, H, D) -> (B, H, N, D)
+    # jvp_attention (Triton) requires contiguous memory for these layouts
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
+
+    return q, k, v
+
+
+def _transpose_out(out):
+    # Restore flash_attn layout: (B, H, N, D) -> (B, N, H, D)
+    return out.transpose(1, 2).contiguous()
+
+
+def _jvp_flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False):
+    """
+    Wrapper for jvp_flash_attention to match flash_attn_qkvpacked_func API.
+    Input qkv: (B, N, 3, H, D)
+    Output: (B, N, H, D)
+    """
+
+    q, k, v = _unpack_qkv(qkv)
+
+    out = JVPAttn.fwd_dual(
+        q, k, v,
+        dropout_p=dropout_p,
+        sm_scale=softmax_scale,
+        causal=causal,
+    )
+
+    return _transpose_out(out)
+
+
+def _sdpa_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False):
+    """
+    Wrapper for F.scaled_dot_product_attention to match flash_attn_qkvpacked_func API.
+    Input qkv: (B, N, 3, H, D)
+    Output: (B, N, H, D)
+    """
+
+    q, k, v = _unpack_qkv(qkv)
+
+    with sdpa_kernel(SDPBackend.MATH):
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            scale=softmax_scale,
+            is_causal=causal,
+            dropout_p=dropout_p,
+        )
+
+    return _transpose_out(out)
+
+
+def flash_attn_qkvpacked_func_wrapper(qkv, dropout_p=0.0, softmax_scale=None, causal=False):
+    """
+    flash_attn_qkvpacked_func_wrapper is a wrapper on `flash_attn.flash_attn_qkvpacked_func` which adds
+    a forward mode AD path based on the dual number implementation.
+
+    Notes:
+    - we cannot do reverse mode AD using `torch.func.vjp` because flash_attn API doesn't have 
+      the static method `setup_context` implemented, and so we must the older API 
+    `torch.autograd.functional.vjp`.
+    - we recommend using the `torch.func.jvp/linearize` API for forward mode AD which is based on dual
+      numbers.
+    """
+
+    unpacked = fwAD.unpack_dual(qkv)
+    primal_qkv = unpacked.primal
+    tangent_qkv = unpacked.tangent  # This is None if no JVP is being done
+    attn_func = flash_attn_qkvpacked_func if tangent_qkv is None else _jvp_flash_attn_qkvpacked_func
+
+    return attn_func(qkv, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal)
+
+# ========================================================================================================
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
@@ -82,7 +167,9 @@ class Attention(nn.Module):
 
         data_type = qkv.dtype
         qkv=qkv.to(torch.float16) 
-        x = flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=self.scale, causal=False).reshape(B, N, C)       
+        # original code:
+        # x = flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=self.scale, causal=False).reshape(B, N, C)
+        x = flash_attn_qkvpacked_func_wrapper(qkv, dropout_p=0.0, softmax_scale=self.scale, causal=False).reshape(B, N, C)
         x=x.to(data_type)
 
         x = self.proj(x)
