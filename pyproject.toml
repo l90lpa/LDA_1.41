@@ -8,14 +8,15 @@ version = "1.0.0"
 description = "Forecast and autoencoder model for LDA (see paper Physically consistent global atmospheric data assimilation with machine learning in latent space)."
 requires-python = ">=3.9"
 dependencies = [
-  "torch>=2.6.0",
-  "torchvision>=0.21.0",
+  "torch>=2.8.0",
+  "torchvision>=0.23.0",
   "numpy>=1.26.4",
   "PyYAML>=6.0.2",
   "timm>=1.0.25",
   "fairscale>=0.4.13",
   "dict-recursive-update>=1.0.1",
-  "flash_attn>=2.7.4.post1",
+  "flash_attn>=2.8.3",
+  "jvp_flash_attention>=0.14.0"
 ]
 
 [tool.setuptools]
