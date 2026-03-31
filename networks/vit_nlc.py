@@ -14,87 +14,144 @@ cwd = os.getcwd()
 
 # ========================================================================================================
 
-import torch.autograd.forward_ad as fwAD
-from torch.nn.attention import SDPBackend, sdpa_kernel
-from jvp_flash_attention.jvp_attention import JVPAttn, attention as jvp_attention
+class TiledSDPA(torch.autograd.Function):
+    @staticmethod
+    def forward(qkv, softmax_scale, causal, block_size):
+        # qkv: [B, S, 3, H, D]
+        q = qkv[:, :, 0].transpose(1, 2) * softmax_scale
+        k = qkv[:, :, 1].transpose(1, 2)
+        v = qkv[:, :, 2].transpose(1, 2)
+
+        B, H, S, D = q.shape
+        out = torch.zeros_like(q)
+        l_stats = torch.zeros((B, H, S, 1), device=q.device, dtype=q.dtype)
+        m_stats = torch.full((B, H, S, 1), float('-inf'), device=q.device, dtype=q.dtype)
+
+        for j in range(0, S, block_size):
+            end_j = min(j + block_size, S)
+            kb, vb = k[:, :, j:end_j], v[:, :, j:end_j]
+
+            # Matmul + Causal Mask
+            attn = torch.matmul(q, kb.transpose(-1, -2))
+            if causal:
+                rows = torch.arange(S, device=q.device).view(-1, 1)
+                cols = torch.arange(j, end_j, device=q.device).view(1, -1)
+                attn.masked_fill_(rows < cols, float('-inf'))
+
+            # Online Softmax updates
+            mi_j = torch.max(attn, dim=-1, keepdim=True).values
+            m_new = torch.max(m_stats, mi_j)
+            exp_a = torch.exp(attn - m_new)
+            alpha = torch.exp(m_stats - m_new)
+
+            l_stats = (l_stats * alpha) + exp_a.sum(dim=-1, keepdim=True)
+            out = (out * alpha) + torch.matmul(exp_a, vb)
+            m_stats = m_new
+
+        out = out / l_stats
+        # Return primal result and intermediate stats for context
+        return out.transpose(1, 2).contiguous(), l_stats, m_stats
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        qkv, softmax_scale, causal, block_size = inputs
+        out_packed, l_stats, m_stats = output
+
+        # Save necessary tensors for VJP and JVP
+        ctx.mark_non_differentiable(l_stats, m_stats)
+        # We transpose 'out' to [B, H, S, D] for consistent calculus in AD methods
+        ctx.save_for_backward(qkv, out_packed.transpose(1, 2), l_stats, m_stats)
+        ctx.save_for_forward(qkv, out_packed.transpose(1, 2), l_stats, m_stats)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.block_size = block_size
+
+    @staticmethod
+    def jvp(ctx, *g_inputs):
+        # Forward-mode AD: dO = d(Softmax(P)V)
+        t_qkv = g_inputs[0] # Tangent of the packed qkv
+        qkv, out, l_stats, m_stats = ctx.saved_tensors
+        scale = ctx.softmax_scale
+
+        # Unpack Primals and Tangents
+        q = qkv[:, :, 0].transpose(1, 2) * scale
+        k = qkv[:, :, 1].transpose(1, 2)
+        v = qkv[:, :, 2].transpose(1, 2)
+
+        t_q = t_qkv[:, :, 0].transpose(1, 2) * scale
+        t_k = t_qkv[:, :, 1].transpose(1, 2)
+        t_v = t_qkv[:, :, 2].transpose(1, 2)
+
+        dot_out = torch.zeros_like(q)
+        dot_l = torch.zeros_like(l_stats)
+
+        for j in range(0, q.size(2), ctx.block_size):
+            end_j = min(j + ctx.block_size, q.size(2))
+            kb, vb, tkb, tvb = k[:,:,j:end_j], v[:,:,j:end_j], t_k[:,:,j:end_j], t_v[:,:,j:end_j]
+
+            attn = torch.matmul(q, kb.transpose(-1, -2))
+            if ctx.causal:
+                rows = torch.arange(q.size(2), device=q.device).view(-1, 1)
+                cols = torch.arange(j, end_j, device=q.device).view(1, -1)
+                attn.masked_fill_(rows < cols, float('-inf'))
+
+            p = torch.exp(attn - m_stats) / l_stats
+            # dP = P * (dQ K^T + Q dK^T)
+            dp_raw = p * (torch.matmul(t_q, kb.transpose(-1, -2)) + torch.matmul(q, tkb.transpose(-1, -2)))
+
+            dot_out += torch.matmul(dp_raw, vb) + torch.matmul(p, tvb)
+            dot_l += dp_raw.sum(dim=-1, keepdim=True)
+
+        # Apply derivative of quotient rule for normalization: d(Out/L) = dOut/L - Out/L * dL/L
+        res_t = (dot_out - (out * dot_l)).transpose(1, 2)
+        return res_t.contiguous(), None, None
+
+    @staticmethod
+    def backward(ctx, grad_out, grad_l, grad_m):
+        # Reverse-mode AD
+        qkv, out, l_stats, m_stats = ctx.saved_tensors
+        grad_out = grad_out.transpose(1, 2)
+        scale = ctx.softmax_scale
+
+        q, k, v = qkv[:,:,0].transpose(1,2)*scale, qkv[:,:,1].transpose(1,2), qkv[:,:,2].transpose(1,2)
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+
+        # Softmax gradient term: D = rowsum(grad_out * out)
+        diag_D = torch.sum(grad_out * out, dim=-1, keepdim=True)
+
+        for j in range(0, q.size(2), ctx.block_size):
+            end_j = min(j + ctx.block_size, q.size(2))
+            kb, vb = k[:,:,j:end_j], v[:,:,j:end_j]
+
+            attn = torch.matmul(q, kb.transpose(-1, -2))
+            if ctx.causal:
+                rows = torch.arange(q.size(2), device=q.device).view(-1, 1)
+                cols = torch.arange(j, end_j, device=q.device).view(1, -1)
+                attn.masked_fill_(rows < cols, float('-inf'))
+
+            p = torch.exp(attn - m_stats) / l_stats
+
+            # Linear VJP updates
+            dv[:, :, j:end_j] = torch.matmul(p.transpose(-1, -2), grad_out)
+            dp = p * (torch.matmul(grad_out, vb.transpose(-1, -2)) - diag_D)
+
+            dq += torch.matmul(dp, kb)
+            dk[:, :, j:end_j] = torch.matmul(dp.transpose(-1, -2), q)
+
+        dqkv = torch.stack([dq * scale, dk, dv], dim=2).transpose(1, 3)
+        return dqkv, None, None, None
 
 
-def _unpack_qkv(qkv):
-    # 1. Unpack the packed tensor: (B, N, 3, H, D) -> 3 x (B, N, H, D)
-    q, k, v = qkv.unbind(dim=2)
-
-    # 2. Change layout to Head-First: (B, N, H, D) -> (B, H, N, D)
-    # jvp_attention (Triton) requires contiguous memory for these layouts
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
-    v = v.transpose(1, 2).contiguous()
-
-    return q, k, v
-
-
-def _transpose_out(out):
-    # Restore flash_attn layout: (B, H, N, D) -> (B, N, H, D)
-    return out.transpose(1, 2).contiguous()
-
-
-def _jvp_flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False):
-    """
-    Wrapper for jvp_flash_attention to match flash_attn_qkvpacked_func API.
-    Input qkv: (B, N, 3, H, D)
-    Output: (B, N, H, D)
-    """
-
-    q, k, v = _unpack_qkv(qkv)
-
-    out = JVPAttn.fwd_dual(
-        q, k, v,
-        dropout_p=dropout_p,
-        sm_scale=softmax_scale,
-        causal=causal,
-    )
-
-    return _transpose_out(out)
-
-
-def _sdpa_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False):
-    """
-    Wrapper for F.scaled_dot_product_attention to match flash_attn_qkvpacked_func API.
-    Input qkv: (B, N, 3, H, D)
-    Output: (B, N, H, D)
-    """
-
-    q, k, v = _unpack_qkv(qkv)
-
-    with sdpa_kernel(SDPBackend.MATH):
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            scale=softmax_scale,
-            is_causal=causal,
-            dropout_p=dropout_p,
-        )
-
-    return _transpose_out(out)
-
-
-def flash_attn_qkvpacked_func_wrapper(qkv, dropout_p=0.0, softmax_scale=None, causal=False):
-    """
-    flash_attn_qkvpacked_func_wrapper is a wrapper on `flash_attn.flash_attn_qkvpacked_func` which adds
-    a forward mode AD path based on the dual number implementation.
-
-    Notes:
-    - we cannot do reverse mode AD using `torch.func.vjp` because flash_attn API doesn't have 
-      the static method `setup_context` implemented, and so we must the older API 
-    `torch.autograd.functional.vjp`.
-    - we recommend using the `torch.func.jvp/linearize` API for forward mode AD which is based on dual
-      numbers.
-    """
-
-    unpacked = fwAD.unpack_dual(qkv)
-    primal_qkv = unpacked.primal
-    tangent_qkv = unpacked.tangent  # This is None if no JVP is being done
-    attn_func = flash_attn_qkvpacked_func if tangent_qkv is None else _jvp_flash_attn_qkvpacked_func
-
-    return attn_func(qkv, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal)
+def tiled_spda_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False, block_size=128):
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(qkv.shape[-1])
+    # TiledSDPA returns (out, l_stats, m_stats) but we expose only 'out' to the 
+    # user. l_stats and m_stats are returned to enable them to be captured for
+    # use in forward and reverse mode AD.
+    out, _, _ = TiledSDPA.apply(qkv, softmax_scale, causal, block_size)
+    return out
 
 # ========================================================================================================
 
@@ -163,14 +220,14 @@ class Attention(nn.Module):
     def forward(self, x, H, W):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
-        
 
-        data_type = qkv.dtype
-        qkv=qkv.to(torch.float16) 
+
         # original code:
+        # data_type = qkv.dtype
+        # qkv=qkv.to(torch.float16)
         # x = flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=self.scale, causal=False).reshape(B, N, C)
-        x = flash_attn_qkvpacked_func_wrapper(qkv, dropout_p=0.0, softmax_scale=self.scale, causal=False).reshape(B, N, C)
-        x=x.to(data_type)
+        # x=x.to(data_type)
+        x = tiled_spda_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=self.scale, causal=False).reshape(B, N, C)
 
         x = self.proj(x)
         return x
@@ -1080,7 +1137,6 @@ def Decoder(arch='vit_base', patch_size=(16,16),patch_stride=None, in_chans=227,
         del pretrained_dict
 
     return encoder
-
 
 
 
